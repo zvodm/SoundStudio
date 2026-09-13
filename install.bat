@@ -15,8 +15,7 @@ REM
 REM  all behave exactly like the equivalent install.ps1 call.
 REM ---------------------------------------------------------------------------
 
-REM TODO: set this to your repository once it's pushed, e.g. maksim/SoundStudio.
-set "REPO=OWNER/REPO"
+set "REPO=zvodm/SoundStudio"
 set "BRANCH=main"
 
 set "PS1=%~dp0install.ps1"

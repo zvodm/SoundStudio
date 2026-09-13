@@ -71,7 +71,7 @@
 [CmdletBinding()]
 param(
     # TODO: replace with your repository once it's pushed, e.g. 'maksim/SoundStudio'.
-    [string] $Repo         = 'OWNER/REPO',
+    [string] $Repo         = 'zvodm/SoundStudio',
     [string] $Version      = 'latest',
     [string] $InstallDir   = (Join-Path $env:LOCALAPPDATA 'SoundStudio'),
     [string] $AssetPattern = '',
