@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 
 // ------------------------------------------------------------------
 // The bundled instrument library.
@@ -17,13 +18,34 @@
 //
 // Same "ship it, then get out of the way" contract as the default plugins
 // and the default imgui.ini layout: a file that already exists is never
-// touched, so anything the user has edited, replaced or deliberately
-// deleted-and-recreated stays exactly as they left it. (A preset the user
-// deletes outright does come back on the next launch -- that's the price
-// of not keeping a separate "already shipped" manifest, and re-creating a
-// file in a library folder is a lot less costly than silently overwriting
-// an edited one.)
+// touched, so anything the user has edited or replaced stays exactly as
+// they left it.
 //
-// Call once at startup, after AppPaths::EnsureDirectories().
+// Not called directly at startup any more -- go through
+// DefaultContent::EnsureInstalledOnFirstRun() (app/DefaultContent.h), which
+// only installs the library when nobody has chosen yet. That's what stops
+// a preset the user deleted from reappearing on the next launch.
 // ------------------------------------------------------------------
 void WriteDefaultInstrumentsIfMissing();
+
+// ------------------------------------------------------------------
+// The catalogue, so something other than this file can decide what gets
+// installed -- the installer's pick-list enumerates it rather than keeping
+// its own copy of the list, which would drift the moment a preset is added
+// here. See app/DefaultContent.h.
+// ------------------------------------------------------------------
+
+struct DefaultInstrumentInfo
+{
+    const char* file  = "";  // filename stem, and the id the selection list uses
+    const char* name  = "";  // display name
+    const char* group = "";  // family: "Organs", "Guitars", "Drum Kit", ...
+};
+
+int DefaultInstrumentCount();
+DefaultInstrumentInfo DefaultInstrumentAt(int index);
+
+// Writes one bundled preset by its file stem. Returns false only if no
+// bundled preset has that name, or the write failed -- a preset that is
+// already on disk counts as success (and is left alone unless overwrite).
+bool WriteDefaultInstrument(const std::string& fileStem, bool overwrite = false);

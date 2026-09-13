@@ -49,6 +49,7 @@ SET CPP_FILES= ^
 %SRC_DIR%\ui\Theme.cpp ^
 %SRC_DIR%\ui\DefaultLayout.cpp ^
 %SRC_DIR%\app\AppPaths.cpp ^
+%SRC_DIR%\app\DefaultContent.cpp ^
 %SRC_DIR%\plugin\PluginManager.cpp ^
 %SRC_DIR%\plugin\PluginHost.cpp ^
 %SRC_DIR%\plugin\DefaultPlugins.cpp ^

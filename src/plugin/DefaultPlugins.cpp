@@ -484,28 +484,79 @@ function DrawUI()
 end
 )LUAEOF";
 
-// Writes `content` to `path` only if nothing is there yet -- never
-// overwrites a file the user has since edited or replaced.
-void WriteIfMissing(const std::string& path, const char* content)
+// Writes `content` to `path`. Unless overwrite is set, a file that already
+// exists is left exactly as it is -- never clobber something the user has
+// since edited or replaced.
+bool WriteScript(const std::string& path, const char* content, bool overwrite)
 {
-    FILE* existing = fopen(path.c_str(), "r");
-    if (existing)
+    if (!overwrite)
     {
-        fclose(existing);
-        return;
+        FILE* existing = fopen(path.c_str(), "r");
+        if (existing)
+        {
+            fclose(existing);
+            return true; // already installed; nothing to do, and not an error
+        }
     }
 
     FILE* f = fopen(path.c_str(), "w");
-    if (!f) return;
+    if (!f) return false;
     fputs(content, f);
-    fclose(f);
+    return fclose(f) == 0;
 }
+
+struct BundledPlugin
+{
+    const char* file;
+    const char* name;
+    const char* description;
+    const char* source;
+};
+
+const BundledPlugin kBundledPlugins[] =
+{
+    { "InstrumentEditor", "Instrument Editor",
+      "Every instrument value as an exact text field instead of a slider, plus a preset browser.",
+      kInstrumentEditorLua },
+    { "WaveEditor", "Wave Editor",
+      "Draw or type a formula for a custom oscillator waveform and register it by name.",
+      kWaveEditorLua },
+    { "Oscilloscope", "Oscilloscope",
+      "A colored live scope of the master output.",
+      kOscilloscopeLua },
+};
 
 } // namespace
 
+int DefaultPluginCount()
+{
+    return (int)(sizeof(kBundledPlugins) / sizeof(kBundledPlugins[0]));
+}
+
+DefaultPluginInfo DefaultPluginAt(int index)
+{
+    DefaultPluginInfo info{};
+    if (index < 0 || index >= DefaultPluginCount()) return info;
+
+    const BundledPlugin& p = kBundledPlugins[index];
+    info.file        = p.file;
+    info.name        = p.name;
+    info.description = p.description;
+    return info;
+}
+
+bool WriteDefaultPlugin(const std::string& fileStem, bool overwrite)
+{
+    for (const BundledPlugin& p : kBundledPlugins)
+    {
+        if (fileStem != p.file) continue;
+        return WriteScript(AppPaths::PluginsDir() + "/" + p.file + ".lua", p.source, overwrite);
+    }
+    return false; // no bundled plugin by that name
+}
+
 void WriteDefaultPluginsIfMissing()
 {
-    WriteIfMissing(AppPaths::PluginsDir() + "/WaveEditor.lua", kWaveEditorLua);
-    WriteIfMissing(AppPaths::PluginsDir() + "/Oscilloscope.lua", kOscilloscopeLua);
-    WriteIfMissing(AppPaths::PluginsDir() + "/InstrumentEditor.lua", kInstrumentEditorLua);
+    for (const BundledPlugin& p : kBundledPlugins)
+        WriteDefaultPlugin(p.file, /*overwrite=*/false);
 }

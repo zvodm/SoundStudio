@@ -42,6 +42,24 @@
 .PARAMETER AddToPath
     Append the install folder to the user's PATH.
 
+.PARAMETER DefaultContent
+    What to do about SoundStudio's ~108 bundled instrument presets and its
+    Lua plugins:
+      Ask   show a pick-list and install what you tick (default; falls back
+            to All when there's no interactive console)
+      All   install everything without asking
+      None  install nothing, and record that so first launch doesn't either
+      Skip  don't touch it at all -- SoundStudio installs its full library
+            the first time you run it
+
+.PARAMETER ContentSource
+    Where the presets, waves and plugins come from:
+      Auto      the repository's Instruments/Waves/Plugins branches, falling
+                back to the library built into SoundStudio.exe when GitHub
+                can't be reached (default)
+      GitHub    the content branches only
+      Embedded  the executable's own library only -- no network needed
+
 .PARAMETER Force
     Reinstall even if the requested version is already installed, and close a
     running SoundStudio instead of refusing to overwrite it.
@@ -61,6 +79,10 @@
     .\install.ps1 -Version v1.2.0 -DesktopShortcut -AddToPath
 
 .EXAMPLE
+    .\install.ps1 -DefaultContent None
+    Installs the program but no presets or plugins.
+
+.EXAMPLE
     .\install.ps1 -Uninstall
 
 .NOTES
@@ -70,7 +92,6 @@
 
 [CmdletBinding()]
 param(
-    # TODO: replace with your repository once it's pushed, e.g. 'maksim/SoundStudio'.
     [string] $Repo         = 'zvodm/SoundStudio',
     [string] $Version      = 'latest',
     [string] $InstallDir   = (Join-Path $env:LOCALAPPDATA 'SoundStudio'),
@@ -78,6 +99,10 @@ param(
     [switch] $DesktopShortcut,
     [switch] $NoShortcut,
     [switch] $AddToPath,
+    [ValidateSet('Ask', 'All', 'None', 'Skip')]
+    [string] $DefaultContent = 'Ask',
+    [ValidateSet('Auto', 'GitHub', 'Embedded')]
+    [string] $ContentSource = 'Auto',
     [switch] $Force,
     [switch] $Uninstall,
     [switch] $RemoveUserData
@@ -232,7 +257,14 @@ if (`$userPath) {
 }
 
 Remove-Item -LiteralPath `$installDir -Recurse -Force
-if (`$RemoveUserData) { Remove-Item -LiteralPath `$userData -Recurse -Force }
+if (`$RemoveUserData) {
+    Remove-Item -LiteralPath `$userData -Recurse -Force
+} else {
+    # The manifest is installer bookkeeping, not the user's work. Leaving it
+    # behind would mean a later reinstall silently skips the pick-list and
+    # installs nothing.
+    Remove-Item -LiteralPath (Join-Path `$userData 'defaults.manifest') -Force
+}
 
 Write-Host 'SoundStudio has been uninstalled.' -ForegroundColor Green
 if (-not `$RemoveUserData) {
@@ -444,6 +476,607 @@ function Expand-ZipTo {
 }
 
 # ---------------------------------------------------------------------------
+# Bundled content: the instrument-preset and plugin pick-list
+#
+# SoundStudio ships ~108 instrument presets and 3 Lua plugins inside the
+# executable. Rather than keeping a copy of that catalogue here -- which would
+# drift the first time a preset is added -- the installer asks the executable
+# what it has (--list-defaults) and hands back the chosen ids
+# (--install-defaults). Both modes write to a file instead of stdout, because
+# SoundStudio is a GUI-subsystem binary with no console to print to.
+# ---------------------------------------------------------------------------
+
+# Runs one of the headless content modes. The executable is a GUI binary, so
+# `&` would not wait for it -- hence Start-Process -Wait. The timeout matters:
+# an older SoundStudio.exe doesn't know these switches and would just open its
+# window, leaving the installer waiting on it forever.
+function Invoke-ContentMode {
+    param([string] $Exe, [string] $Mode, [string] $FilePath, [int] $TimeoutSeconds = 30)
+
+    try {
+        # No -WindowStyle: it's a Windows-only parameter, and it would buy
+        # nothing here anyway -- these modes return before SoundStudio opens
+        # a window, and it's a GUI-subsystem binary, so there's no console
+        # flash either.
+        $process = Start-Process -FilePath $Exe -ArgumentList @($Mode, $FilePath) `
+                                 -PassThru -ErrorAction Stop
+    } catch {
+        return @{ Ok = $false; Reason = "couldn't start $Exe ($($_.Exception.Message))" }
+    }
+
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $process.Kill() } catch { }
+        return @{ Ok = $false; Reason = "SoundStudio.exe didn't respond to $Mode (an older build that doesn't support it?)" }
+    }
+
+    if ($process.ExitCode -ne 0) {
+        return @{ Ok = $false; Reason = "$Mode failed with exit code $($process.ExitCode)" }
+    }
+    return @{ Ok = $true; Reason = '' }
+}
+
+# Catalogue JSON -> the grouped tree the picker walks. Instrument families keep
+# the order the executable reported them in (which is the order they appear in
+# the source table), so the list reads Pianos, Organs, Guitars, ... rather than
+# alphabetically.
+# Both content sources -- the GitHub branches and the executable's embedded
+# catalogue -- reduce to the same shape of row, so the picker only ever has to
+# understand one. Group order is first-seen, which keeps the instrument
+# families in the order they're defined rather than alphabetical.
+function New-TreeFromRows {
+    param($Rows, [string[]] $ExpandedGroups = @())
+
+    $groups = [System.Collections.Generic.List[object]]::new()
+    $byName = @{}
+
+    foreach ($row in $Rows) {
+        if (-not $byName.ContainsKey($row.Group)) {
+            $group = [pscustomobject]@{
+                Name     = $row.Group
+                Expanded = ($ExpandedGroups -contains $row.Group)
+                Items    = [System.Collections.Generic.List[object]]::new()
+            }
+            $byName[$row.Group] = $group
+            $groups.Add($group)
+        }
+        $byName[$row.Group].Items.Add([pscustomobject]@{
+            Id       = $row.Id
+            Label    = $row.Label
+            Note     = $row.Note
+            Selected = $true
+        })
+    }
+
+    return $groups
+}
+
+function New-ContentTree {
+    param($Catalogue)
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($inst in $Catalogue.instruments) {
+        $rows.Add(@{ Id = "instrument:$($inst.id)"; Label = $inst.name; Group = $inst.group; Note = '' })
+    }
+    foreach ($plugin in $Catalogue.plugins) {
+        $rows.Add(@{ Id = "plugin:$($plugin.id)"; Label = $plugin.name; Group = 'Plugins'; Note = $plugin.description })
+    }
+    # Plugins are the handful worth actually reading, so they start open.
+    return New-TreeFromRows -Rows $rows -ExpandedGroups @('Plugins')
+}
+
+function Get-GroupState {
+    param($Group)
+    $total = @($Group.Items).Count
+    if ($total -eq 0) { return 'none' }
+    $selected = @($Group.Items | Where-Object { $_.Selected }).Count
+    if ($selected -eq 0)      { return 'none' }
+    if ($selected -eq $total) { return 'all' }
+    return 'some'
+}
+
+function Set-GroupSelection {
+    param($Group, [bool] $Selected)
+    foreach ($item in $Group.Items) { $item.Selected = $Selected }
+}
+
+# Flattens the tree into the rows actually on screen: every group, plus the
+# items of the expanded ones.
+function Get-VisibleRows {
+    param($Tree)
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in $Tree) {
+        $rows.Add([pscustomobject]@{ Kind = 'Group'; Group = $group; Item = $null })
+        if ($group.Expanded) {
+            foreach ($item in $group.Items) {
+                $rows.Add([pscustomobject]@{ Kind = 'Item'; Group = $group; Item = $item })
+            }
+        }
+    }
+    return $rows
+}
+
+function Get-SelectedIds {
+    param($Tree)
+    $ids = [System.Collections.Generic.List[string]]::new()
+    foreach ($group in $Tree) {
+        foreach ($item in $group.Items) {
+            if ($item.Selected) { $ids.Add($item.Id) }
+        }
+    }
+    return $ids.ToArray()
+}
+
+function Get-SelectionSummary {
+    param($Tree)
+    $selected = 0; $total = 0
+    foreach ($group in $Tree) {
+        foreach ($item in $group.Items) {
+            $total++
+            if ($item.Selected) { $selected++ }
+        }
+    }
+    return @{ Selected = $selected; Total = $total }
+}
+
+# True when there is a real console to draw a menu on and read keys from.
+function Test-CanPrompt {
+    try {
+        if ([Console]::IsInputRedirected) { return $false }
+        if (-not [Environment]::UserInteractive) { return $false }
+        $null = $Host.UI.RawUI.WindowSize
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# The one impure step of the picker loop, behind its own function so the
+# selection logic can be driven from a test with a scripted key sequence
+# instead of a keyboard.
+function Read-PickerKey {
+    return [Console]::ReadKey($true)
+}
+
+function Show-ContentPicker {
+    param($Tree)
+
+    $cursor = 0
+    $scroll = 0
+
+    while ($true) {
+        $rows = @(Get-VisibleRows -Tree $Tree)
+        if ($cursor -ge $rows.Count) { $cursor = $rows.Count - 1 }
+        if ($cursor -lt 0) { $cursor = 0 }
+
+        # Full redraw each keystroke. Cheaper approaches need cursor
+        # positioning, which throws in hosts that don't own a real screen
+        # buffer -- and this list is short enough that it doesn't matter.
+        $height = 20
+        try { $height = [Math]::Max(8, $Host.UI.RawUI.WindowSize.Height - 10) } catch { }
+
+        if ($cursor -lt $scroll) { $scroll = $cursor }
+        if ($cursor -ge $scroll + $height) { $scroll = $cursor - $height + 1 }
+        if ($scroll -lt 0) { $scroll = 0 }
+
+        Clear-Host
+        Write-Host ''
+        Write-Host '  Choose what to install' -ForegroundColor White
+        Write-Host '  Presets go in your SoundStudio\Instruments folder, plugins in Plugins\.' -ForegroundColor DarkGray
+        Write-Host ''
+
+        $last = [Math]::Min($rows.Count - 1, $scroll + $height - 1)
+        for ($i = $scroll; $i -le $last; $i++) {
+            $row       = $rows[$i]
+            $isCursor  = ($i -eq $cursor)
+            $pointer   = if ($isCursor) { '>' } else { ' ' }
+
+            if ($row.Kind -eq 'Group') {
+                $state = Get-GroupState -Group $row.Group
+                $box   = switch ($state) { 'all' { '[x]' } 'some' { '[-]' } default { '[ ]' } }
+                $arrow = if ($row.Group.Expanded) { '-' } else { '+' }
+                $count = @($row.Group.Items).Count
+                $text  = "  $pointer $box $arrow $($row.Group.Name) ($count)"
+                $color = if ($isCursor) { 'Cyan' } else { 'White' }
+            }
+            else {
+                $box   = if ($row.Item.Selected) { '[x]' } else { '[ ]' }
+                $text  = "  $pointer       $box $($row.Item.Label)"
+                if ($row.Item.Note) { $text += "  -- $($row.Item.Note)" }
+                $color = if ($isCursor) { 'Cyan' } else { 'Gray' }
+            }
+
+            # Trim rather than wrap: a wrapped row would break the one-row-per-
+            # entry arithmetic the cursor and scrolling depend on.
+            $width = 100
+            try { $width = [Math]::Max(40, $Host.UI.RawUI.WindowSize.Width - 2) } catch { }
+            if ($text.Length -gt $width) { $text = $text.Substring(0, $width - 1) + [char]0x2026 }
+
+            Write-Host $text -ForegroundColor $color
+        }
+
+        if ($rows.Count -gt $height) {
+            Write-Host "  ... $($rows.Count - $height) more (scroll with the arrow keys)" -ForegroundColor DarkGray
+        }
+
+        $summary = Get-SelectionSummary -Tree $Tree
+        Write-Host ''
+        Write-Host "  $($summary.Selected) of $($summary.Total) selected" -ForegroundColor Green
+        Write-Host '  Up/Down move   Space toggle   Right/Left expand/collapse' -ForegroundColor DarkGray
+        Write-Host '  A all   N none   Enter install   Esc skip' -ForegroundColor DarkGray
+
+        $key = Read-PickerKey
+        switch ($key.Key) {
+            'UpArrow'    { $cursor-- }
+            'DownArrow'  { $cursor++ }
+            'PageUp'     { $cursor -= $height }
+            'PageDown'   { $cursor += $height }
+            'Home'       { $cursor = 0 }
+            'End'        { $cursor = $rows.Count - 1 }
+
+            'RightArrow' {
+                if ($rows[$cursor].Kind -eq 'Group') { $rows[$cursor].Group.Expanded = $true }
+            }
+            'LeftArrow'  {
+                # From an item, collapsing jumps back up to its own group --
+                # otherwise the row under the cursor vanishes from under it.
+                if ($rows[$cursor].Kind -eq 'Item') {
+                    $group = $rows[$cursor].Group
+                    $group.Expanded = $false
+                    $newRows = @(Get-VisibleRows -Tree $Tree)
+                    for ($j = 0; $j -lt $newRows.Count; $j++) {
+                        if ($newRows[$j].Kind -eq 'Group' -and $newRows[$j].Group -eq $group) { $cursor = $j; break }
+                    }
+                } else {
+                    $rows[$cursor].Group.Expanded = $false
+                }
+            }
+
+            'Spacebar' {
+                $row = $rows[$cursor]
+                if ($row.Kind -eq 'Group') {
+                    # A part-selected group fills in rather than emptying --
+                    # the same way a tri-state checkbox behaves everywhere else.
+                    $turnOn = (Get-GroupState -Group $row.Group) -ne 'all'
+                    Set-GroupSelection -Group $row.Group -Selected $turnOn
+                } else {
+                    $row.Item.Selected = -not $row.Item.Selected
+                }
+            }
+
+            'Enter'  { Clear-Host; return $true }
+            'Escape' { Clear-Host; return $false }
+
+            default {
+                switch ("$($key.KeyChar)".ToUpper()) {
+                    'A' { foreach ($g in $Tree) { Set-GroupSelection -Group $g -Selected $true } }
+                    'N' { foreach ($g in $Tree) { Set-GroupSelection -Group $g -Selected $false } }
+                }
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Content branches
+#
+# The instrument presets, custom waves and plugins live on their own branches
+# of the repository -- Instruments, Waves and Plugins -- rather than in the
+# source tree. Reading them from there rather than from the executable means
+# the library can grow by pushing a file, with no new release; the embedded
+# copy inside SoundStudio.exe stays as the offline fallback.
+# ---------------------------------------------------------------------------
+
+$ContentBranches = @(
+    [pscustomobject]@{ Branch = 'Instruments'; Extension = '.ssip';   Folder = 'Instruments'; Label = 'Instruments' }
+    [pscustomobject]@{ Branch = 'Waves';       Extension = '.sswave'; Folder = 'Waves';       Label = 'Waves' }
+    [pscustomobject]@{ Branch = 'Plugins';     Extension = '.lua';    Folder = 'Plugins';     Label = 'Plugins' }
+)
+
+# One API call per branch: the recursive trees endpoint returns every blob at
+# once, so this works whether the files sit flat in the branch root or are
+# sorted into folders. Returns $null when the branch simply isn't there --
+# which is a normal state, not an error, for a repo that only uses some of them.
+function Get-BranchFiles {
+    param([string] $Repository, $Spec)
+
+    $uri = "https://api.github.com/repos/$Repository/git/trees/$($Spec.Branch)?recursive=1"
+    try {
+        $tree = Invoke-RestMethod -Uri $uri -Headers (Get-GitHubHeaders) -Method Get
+    } catch {
+        $status = $null
+        try { $status = [int] $_.Exception.Response.StatusCode } catch { }
+        if ($status -eq 404) { return $null }
+        throw
+    }
+
+    if ($tree.PSObject.Properties.Name -contains 'truncated' -and $tree.truncated) {
+        Write-Note "The $($Spec.Branch) branch is too large for one listing; some files won't be offered."
+    }
+
+    $files = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in $tree.tree) {
+        if ($entry.type -ne 'blob') { continue }
+        if (-not $entry.path.EndsWith($Spec.Extension, [StringComparison]::OrdinalIgnoreCase)) { continue }
+
+        $leaf = Split-Path $entry.path -Leaf
+        $files.Add([pscustomobject]@{
+            Branch = $Spec.Branch
+            Folder = $Spec.Folder
+            Path   = $entry.path
+            Name   = $leaf
+            Stem   = [IO.Path]::GetFileNameWithoutExtension($leaf)
+            Dir    = (((Split-Path $entry.path -Parent) -replace '\\', '/'))
+        })
+    }
+    return $files
+}
+
+# Asks the installed executable what families its own presets belong to, purely
+# so a flat Instruments branch can still be grouped as Pianos / Organs /
+# Guitars rather than one 108-entry list. Entirely optional: without it the
+# files just group under the branch name.
+function Get-EmbeddedFamilyMap {
+    param([string] $Exe)
+
+    $map = @{}
+    if (-not (Test-Path -LiteralPath $Exe)) { return $map }
+
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("ss-catalogue-" + [Guid]::NewGuid().ToString('N') + '.json')
+    try {
+        $listed = Invoke-ContentMode -Exe $Exe -Mode '--list-defaults' -FilePath $temp
+        if (-not $listed.Ok) { return $map }
+
+        $catalogue = Get-Content -LiteralPath $temp -Raw | ConvertFrom-Json
+        foreach ($inst in $catalogue.instruments) { $map[$inst.id] = $inst.group }
+    } catch {
+        # A best-effort nicety; never worth failing the install over.
+    } finally {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    }
+    return $map
+}
+
+function New-GitHubContentTree {
+    param($Files, $FamilyMap)
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($file in $Files) {
+        # Grouping, best information first: a folder inside the branch is the
+        # author's own grouping, so it wins; failing that the family the
+        # executable knows this preset by; failing that, the branch itself.
+        $group =
+            if ($file.Dir)                        { "$($file.Branch)/$($file.Dir)" }
+            elseif ($FamilyMap.ContainsKey($file.Stem)) { $FamilyMap[$file.Stem] }
+            else                                  { $file.Branch }
+
+        $rows.Add(@{
+            Id    = "github:$($file.Branch)|$($file.Path)"
+            Label = $file.Stem
+            Group = $group
+            Note  = ''
+        })
+    }
+    # Waves and Plugins are short lists; instrument families stay collapsed.
+    return New-TreeFromRows -Rows $rows -ExpandedGroups @('Waves', 'Plugins')
+}
+
+# Downloads the ticked files into the user's SoundStudio folders. raw.
+# githubusercontent.com serves these, which (unlike the API) has no meaningful
+# rate limit, so a hundred-odd small files is fine.
+function Install-GitHubContent {
+    param([string] $Repository, [string[]] $Ids, [string] $Root)
+
+    $downloaded = 0
+    $skipped    = 0
+    $failed     = 0
+
+    $previousProgress = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+        $index = 0
+        foreach ($id in $Ids) {
+            $index++
+            if ($id -notmatch '^github:([^|]+)\|(.+)$') { continue }
+            $branch = $Matches[1]
+            $path   = $Matches[2]
+
+            $spec = $ContentBranches | Where-Object { $_.Branch -eq $branch } | Select-Object -First 1
+            if (-not $spec) { continue }
+
+            $destDir = Join-Path $Root $spec.Folder
+            if (-not (Test-Path -LiteralPath $destDir)) {
+                New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+            }
+
+            $dest = Join-Path $destDir (Split-Path $path -Leaf)
+            if (Test-Path -LiteralPath $dest) { $skipped++; continue }  # never clobber a file already there
+
+            # The path has to survive as a URL: raw.githubusercontent.com wants
+            # each segment escaped, but the slashes between them left alone.
+            $encoded = ($path -split '/' | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/'
+            $uri = "https://raw.githubusercontent.com/$Repository/$branch/$encoded"
+
+            try {
+                $headers = @{ 'User-Agent' = 'SoundStudio-Installer' }
+                if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $($env:GITHUB_TOKEN)" }
+                Invoke-WebRequest -Uri $uri -Headers $headers -OutFile $dest -UseBasicParsing
+                $downloaded++
+            } catch {
+                $failed++
+            }
+
+            if ($index % 20 -eq 0) { Write-Info "  $index of $($Ids.Count)..." }
+        }
+    } finally {
+        $ProgressPreference = $previousProgress
+    }
+
+    return @{ Downloaded = $downloaded; Skipped = $skipped; Failed = $failed }
+}
+
+# Stamps <SoundStudio>/defaults.manifest so the app's first launch doesn't then
+# install its whole embedded library on top of what was just downloaded. Only
+# the file's existence carries meaning (see app/DefaultContent.h); the lines
+# inside it are for whoever opens it.
+function Write-ContentManifest {
+    param([string] $Root, [string[]] $Ids, [string] $SourceNote)
+
+    if (-not (Test-Path -LiteralPath $Root)) {
+        New-Item -ItemType Directory -Path $Root -Force | Out-Null
+    }
+
+    $lines = @(
+        '# SoundStudio bundled-content manifest',
+        '#',
+        "# Written by the installer ($SourceNote).",
+        '# Its existence is what stops SoundStudio re-creating presets and',
+        '# plugins you have since deleted. Delete it to be offered the whole',
+        '# bundled library again on the next launch.',
+        'version 1'
+    ) + $Ids
+
+    Set-Content -LiteralPath (Join-Path $Root 'defaults.manifest') -Value $lines -Encoding ASCII
+}
+
+function Invoke-DefaultContentSetup {
+    param([string] $Directory, [string] $Mode, [string] $Repository, [string] $Source)
+
+    if ($Mode -eq 'Skip') {
+        Write-Info 'Skipping the preset/plugin step; SoundStudio will install its full library on first launch.'
+        return
+    }
+
+    $exe = Join-Path $Directory $ExeName
+    Write-Step 'Instrument presets, waves and plugins'
+
+    # ---- where the catalogue comes from ----
+    $tree = $null
+    $kind = ''
+
+    if ($Source -ne 'Embedded') {
+        $files = [System.Collections.Generic.List[object]]::new()
+        $missingBranches = [System.Collections.Generic.List[string]]::new()
+        $reachable = $true
+
+        foreach ($spec in $ContentBranches) {
+            try {
+                $branchFiles = Get-BranchFiles -Repository $Repository -Spec $spec
+            } catch {
+                Write-Note "Couldn't read the $($spec.Branch) branch: $($_.Exception.Message)"
+                $reachable = $false
+                break
+            }
+            if ($null -eq $branchFiles) { $missingBranches.Add($spec.Branch); continue }
+            foreach ($f in $branchFiles) { $files.Add($f) }
+        }
+
+        if ($reachable -and $files.Count -gt 0) {
+            foreach ($b in $missingBranches) { Write-Info "No $b branch in $Repository; skipping it." }
+            $familyMap = Get-EmbeddedFamilyMap -Exe $exe
+            $tree = New-GitHubContentTree -Files $files -FamilyMap $familyMap
+            $kind = 'GitHub'
+            Write-Ok "$($files.Count) file(s) on the content branches of $Repository"
+        }
+        elseif ($Source -eq 'GitHub') {
+            Write-Note "Nothing available from the content branches of $Repository, and -ContentSource GitHub rules out the built-in library."
+            return
+        }
+        else {
+            Write-Info 'Content branches unavailable; using the library built into SoundStudio.exe instead.'
+        }
+    }
+
+    if (-not $tree) {
+        if (-not (Test-Path -LiteralPath $exe)) { return }
+
+        $temp = Join-Path ([IO.Path]::GetTempPath()) ("ss-catalogue-" + [Guid]::NewGuid().ToString('N') + '.json')
+        try {
+            $listed = Invoke-ContentMode -Exe $exe -Mode '--list-defaults' -FilePath $temp
+            if (-not $listed.Ok) {
+                Write-Note "Couldn't read the bundled library: $($listed.Reason)"
+                Write-Info 'SoundStudio will install its full library on first launch instead.'
+                return
+            }
+            $catalogue = Get-Content -LiteralPath $temp -Raw | ConvertFrom-Json
+        } catch {
+            Write-Note "The bundled library listing was unreadable: $($_.Exception.Message)"
+            return
+        } finally {
+            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        }
+
+        $tree = New-ContentTree -Catalogue $catalogue
+        $kind = 'Embedded'
+        Write-Ok "$((Get-SelectionSummary -Tree $tree).Total) presets and plugins built into SoundStudio.exe"
+    }
+
+    # ---- what to install ----
+    $effectiveMode = $Mode
+    if ($Mode -eq 'Ask' -and -not (Test-CanPrompt)) {
+        Write-Info 'No interactive console; installing everything. Use -DefaultContent None to skip.'
+        $effectiveMode = 'All'
+    }
+
+    switch ($effectiveMode) {
+        'None' { foreach ($g in $tree) { Set-GroupSelection -Group $g -Selected $false } }
+        'All'  { foreach ($g in $tree) { Set-GroupSelection -Group $g -Selected $true } }
+        'Ask'  {
+            if (-not (Show-ContentPicker -Tree $tree)) {
+                Write-Info 'Skipped; SoundStudio will install its full library on first launch.'
+                return
+            }
+        }
+    }
+
+    $selected = @(Get-SelectedIds -Tree $tree)
+
+    # ---- install it ----
+    if ($kind -eq 'GitHub') {
+        if ($selected.Count -gt 0) {
+            Write-Info "Downloading $($selected.Count) file(s)..."
+            $result = Install-GitHubContent -Repository $Repository -Ids $selected -Root $UserDataDir
+
+            $parts = @("$($result.Downloaded) downloaded")
+            if ($result.Skipped -gt 0) { $parts += "$($result.Skipped) already there" }
+            if ($result.Failed  -gt 0) { $parts += "$($result.Failed) failed" }
+            Write-Ok ($parts -join ', ')
+        } else {
+            Write-Ok 'Nothing installed, as chosen.'
+        }
+
+        # Stamped whatever was chosen, including nothing -- otherwise first
+        # launch would install all 108 embedded presets over the top.
+        Write-ContentManifest -Root $UserDataDir -Ids $selected -SourceNote "from the content branches of $Repository"
+        return
+    }
+
+    $work = Join-Path ([IO.Path]::GetTempPath()) ("SoundStudio-content-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    try {
+        $selectionPath = Join-Path $work 'selection.txt'
+        $header = @('# Written by the SoundStudio installer.', "# $($selected.Count) item(s) chosen.")
+        Set-Content -LiteralPath $selectionPath -Value ($header + $selected) -Encoding ASCII
+
+        $installed = Invoke-ContentMode -Exe $exe -Mode '--install-defaults' -FilePath $selectionPath
+        if ($installed.Ok) {
+            if ($selected.Count -eq 0) {
+                Write-Ok 'Nothing installed, as chosen. Your Instruments and Plugins folders are left empty.'
+            } else {
+                $instruments = @($selected | Where-Object { $_ -like 'instrument:*' }).Count
+                $plugins     = @($selected | Where-Object { $_ -like 'plugin:*' }).Count
+                Write-Ok "Installed $instruments preset(s) and $plugins plugin(s)"
+            }
+        } else {
+            Write-Note "Couldn't install the chosen presets: $($installed.Reason)"
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -628,6 +1261,10 @@ try {
             Write-Info 'Already on your PATH'
         }
     }
+
+    # Last, because it's the only step that can want the screen to itself.
+    Invoke-DefaultContentSetup -Directory $InstallDir -Mode $DefaultContent `
+                               -Repository $Repo -Source $ContentSource
 
     Write-Host ''
     Write-Host "  $AppName $tag is installed." -ForegroundColor Green

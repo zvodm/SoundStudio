@@ -16,6 +16,7 @@
 #include "ui/DefaultLayout.h"
 #include "editor/UndoManager.h"
 #include "app/AppPaths.h"
+#include "app/DefaultContent.h"
 #include "plugin/PluginManager.h"
 #include "plugin/PluginHost.h"
 #include "audio/DefaultWaveforms.h"
@@ -60,19 +61,28 @@ static ImU32 CategoryColor(InstrumentCategory category)
     }
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
+    // --list-defaults / --install-defaults: the headless modes the
+    // installer uses to show its pick-list and act on it. These must run
+    // before anything opens a window. See app/DefaultContent.h.
+    {
+        int exitCode = 0;
+        if (DefaultContent::HandleCommandLine(argc, argv, exitCode)) return exitCode;
+    }
+
     // Sets up (and, on a fresh machine/account, creates) the shared
     // SoundStudio working directory -- Waves/Plugins/Songs/Instruments
     // under the user's home dir -- before anything else touches those
     // paths (default Save/Load locations below, plugin loading).
     AppPaths::EnsureDirectories();
 
-    // The bundled .ssip instrument library (pianos, organs, guitars,
-    // brass, reeds, strings, mallets, a drum kit, ...) -- written once
-    // into Instruments/, never overwriting a file that's already there.
-    // See song/DefaultInstruments.h.
-    WriteDefaultInstrumentsIfMissing();
+    // The bundled instrument presets and plugins, but only if nobody has
+    // chosen yet: once defaults.manifest exists -- written by the
+    // installer's pick-list, or by the first launch that installed
+    // everything -- this does nothing, so presets and plugins you delete
+    // stay deleted. See app/DefaultContent.h.
+    DefaultContent::EnsureInstalledOnFirstRun();
 
     const int screenWidth = 600;
     const int screenHeight = 400;

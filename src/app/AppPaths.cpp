@@ -15,13 +15,22 @@ namespace
     // fallbacks for the odd environment that has neither set. Deliberately
     // avoids std::filesystem here -- plain mkdir + getenv has no extra
     // linking requirements to worry about across toolchains.
+    // A variable that is set but empty is treated as not set: taking it at
+    // face value would resolve the SoundStudio folder to "/SoundStudio" and
+    // quietly try to write the whole preset library to the filesystem root.
+    const char* EnvOrNull(const char* name)
+    {
+        const char* value = std::getenv(name);
+        return (value && value[0] != '\0') ? value : nullptr;
+    }
+
     std::string GetHomeDir()
     {
-        if (const char* userProfile = std::getenv("USERPROFILE")) return userProfile; // Windows
-        if (const char* home = std::getenv("HOME")) return home;                      // POSIX
-        const char* drive = std::getenv("HOMEDRIVE");
-        const char* path  = std::getenv("HOMEPATH");
-        if (drive && path) return std::string(drive) + path;                          // older Windows fallback
+        if (const char* userProfile = EnvOrNull("USERPROFILE")) return userProfile; // Windows
+        if (const char* home = EnvOrNull("HOME")) return home;                      // POSIX
+        const char* drive = EnvOrNull("HOMEDRIVE");
+        const char* path  = EnvOrNull("HOMEPATH");
+        if (drive && path) return std::string(drive) + path;                        // older Windows fallback
         return "."; // last resort -- current directory
     }
 

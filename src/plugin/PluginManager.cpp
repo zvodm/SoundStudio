@@ -1,5 +1,4 @@
 #include "plugin/PluginManager.h"
-#include "plugin/DefaultPlugins.h"
 #include "plugin/PluginHost.h"
 #include "song/SongData.h"
 #include "song/InstrumentIO.h"
@@ -484,7 +483,11 @@ void PluginManager::LoadAll()
 {
     Shutdown();
 
-    WriteDefaultPluginsIfMissing();
+    // Deliberately does NOT write the bundled plugins here any more. Which
+    // of them exist is decided once (installer pick-list, or first launch)
+    // and recorded in defaults.manifest -- see app/DefaultContent.h. Doing
+    // it here meant "Reload Plugins" silently resurrected every default the
+    // user had deleted.
 
     DIR* dir = opendir(AppPaths::PluginsDir().c_str());
     if (!dir)
